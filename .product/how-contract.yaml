@@ -59,6 +59,15 @@ top_decisions:
   - at-least-once-emit
   enforced_by:
   - stream-conformance
+- id: residency-materialization
+  decision: 'Throwing the switch materializes the residency physically: the executor launches the mode''s model as a containerized vLLM server on the box over SSH, and retires it before the other mode''s host loads — all behind a ResidencyHost seam with a local backend for offline development.'
+  rationale: A logical mode is bookkeeping until VRAM actually holds the model. Making the switch start and stop the real container gives mode-exclusion teeth in hardware rather than in a flag, and a seam keeps SSH/vLLM specifics out of the core exactly as the Worker and Sandbox seams do — the OpenAiWorker is reused unchanged against the host's endpoint.
+  applies_when: Running real model work on the box.
+  does_not_apply_when: Offline or stub runs with no served model.
+  licenses:
+  - physical-residency
+  enforced_by:
+  - host-conformance
 principles:
 - id: capability-funnel
   statement: A worker holds exactly the capabilities its task needs; excess capability is an under-decomposition defect, never granted away.
@@ -124,6 +133,15 @@ principles:
   - ephemeral-sandbox-runtime
   enforced_by:
   - sandbox-conformance
+- id: physical-residency
+  statement: Exactly one serving host is materialized on the box at a time, and only a health-ready host serves work; the physical residency mirrors the logical mode one-to-one, the prior host retired before the next launches.
+  licensed_by:
+  - residency-materialization
+  realized_by:
+  - ssh-vllm-host
+  - readiness-gated-dispatch
+  enforced_by:
+  - host-conformance
 patterns:
 - id: role-binding-ladder
   shape: A worker role fills at escalating model bindings; on a rejecting verdict the whole unit re-dispatches one binding up (unit-atomic escalation).
@@ -185,6 +203,18 @@ patterns:
   - isolation-by-construction
   enforced_by:
   - sandbox-conformance
+- id: ssh-vllm-host
+  shape: The ResidencyHost seam launches a vLLM server as a container on the box over SSH for one binding, retiring any live host first; a local-process backend stands in for development. The reused OpenAiWorker dispatches inference at the host's OpenAI-compatible /v1 endpoint.
+  realizes:
+  - physical-residency
+  enforced_by:
+  - host-conformance
+- id: readiness-gated-dispatch
+  shape: After launch the host's /v1 endpoint is polled until it answers; confirm-host-ready flips the host to ready, and only a ready host receives cell frontiers — so no batch is dispatched against a cold server.
+  realizes:
+  - physical-residency
+  enforced_by:
+  - host-conformance
 application_contract:
   id: spark-executor-app-contract
   language: Rust
@@ -213,6 +243,9 @@ application_contract:
   - id: effect-tools-only
     statement: Only effect-classified tools may fire during execution; knowledge tools never fire after the input is frozen.
     enforced_by: tool-class-audit
+  - id: single-host-materialized
+    statement: At most one serving host (a vLLM container) is materialized on the box at any instant; the prior host is retired to free VRAM before the next mode's host is launched, and only a health-ready host receives dispatched work.
+    enforced_by: host-conformance
 infrastructure_contract:
   id: single-spark-infra
   satisfies: spark-executor-app-contract

@@ -4,10 +4,11 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use spark_execution::{CommandOracle, Oracle};
 use spark_executor::{DrainOutcome, Engine};
+use spark_host::{HostPhase, HostSpec, SshVllmHost};
 use spark_interface::{Cell, WorkUnit};
 use spark_sandbox::{LocalBroker, LocalSandbox};
 use spark_serving::{CommandWorker, OpenAiWorker, StubWorker, Worker};
@@ -92,14 +93,64 @@ fn cmd_mode_set(m: &str) -> ExitCode {
     let mut e = load();
     match e.throw_switch(mode) {
         Ok(now) => {
-            save(&e).ok();
             println!("box -> {now:?} (residency loaded; the other mode is unloaded from VRAM)");
+            // Physically materialize the residency if a box is configured: the
+            // switch starts/stops the real vLLM container, not just a flag.
+            materialize_if_configured(&mut e, mode);
+            save(&e).ok();
             ExitCode::SUCCESS
         }
         Err(inv) => {
             eprintln!("rejected: {inv} (already in {mode:?} — flips are expensive, a no-op flip is refused)");
             ExitCode::from(1)
         }
+    }
+}
+
+fn mode_lower(m: Mode) -> &'static str {
+    match m {
+        Mode::Off => "off",
+        Mode::Queue => "queue",
+        Mode::Explorer => "explorer",
+    }
+}
+
+/// Build a `HostSpec` for the given mode from the environment, or `None` when no
+/// box is configured (the offline/dev path — logical switch only). The model
+/// served differs by mode (small coder for QUEUE, a large model for EXPLORER).
+fn host_spec_for(mode: Mode) -> Option<HostSpec> {
+    let ssh_target = std::env::var("SPARK_SSH_TARGET").ok()?;
+    let model = match mode {
+        Mode::Queue => std::env::var("SPARK_QUEUE_MODEL").ok(),
+        Mode::Explorer => std::env::var("SPARK_EXPLORER_MODEL").ok(),
+        Mode::Off => None,
+    }
+    .or_else(|| std::env::var("SPARK_VLLM_MODEL").ok())
+    .unwrap_or_else(|| "default".into());
+    let port = std::env::var("SPARK_VLLM_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(8000);
+    let image = std::env::var("SPARK_VLLM_IMAGE").unwrap_or_else(|_| "vllm/vllm-openai:latest".into());
+    let extra_args = std::env::var("SPARK_VLLM_ARGS")
+        .ok()
+        .map(|s| s.split_whitespace().map(String::from).collect())
+        .unwrap_or_default();
+    Some(HostSpec { host_id: format!("{}-host", mode_lower(mode)), model, image, ssh_target, port, extra_args })
+}
+
+/// Retire the prior host and launch + ready the new mode's vLLM container over
+/// SSH. A no-op (logical switch only) when `SPARK_SSH_TARGET` is unset.
+fn materialize_if_configured(e: &mut Engine, mode: Mode) {
+    let Some(spec) = host_spec_for(mode) else {
+        return;
+    };
+    let host = SshVllmHost::default();
+    eprintln!("materializing residency: launching `{}` ({}) on {} ...", spec.image, spec.model, spec.ssh_target);
+    match e.launch_residency(&host, &spec, Duration::from_secs(180)) {
+        Ok(true) => {
+            let url = e.host_handle.as_ref().map(|h| h.endpoint.as_str()).unwrap_or("?");
+            println!("residency ready at {url}");
+        }
+        Ok(false) => eprintln!("host launched but /v1 did not answer in time — check the box; not dispatching yet"),
+        Err(err) => eprintln!("residency materialization failed: {err}"),
     }
 }
 
@@ -117,6 +168,12 @@ fn cmd_status() -> ExitCode {
     println!(
         "utilization:     in_flight={} exploring={} discoveries={}",
         e.utilization.in_flight, e.utilization.exploring, e.utilization.discoveries
+    );
+    println!(
+        "serving host:    phase={:?} ready={} endpoint={}",
+        e.host.phase,
+        e.serving_host_view.ready,
+        e.host_handle.as_ref().map(|h| h.endpoint.as_str()).unwrap_or("-")
     );
     ExitCode::SUCCESS
 }
@@ -193,9 +250,14 @@ fn cmd_serve() -> ExitCode {
     }
     let sandbox = LocalSandbox::default();
     let broker = LocalBroker;
-    // Worker precedence: OpenAI-compatible HTTP server (one resident model serving
-    // every cell) → a per-cell shell command → the deterministic offline stub.
-    let worker: Box<dyn Worker> = if let Some(http) = OpenAiWorker::from_env() {
+    // Worker precedence: a residency materialized by `spark mode set` (the vLLM
+    // host on the box) → an OpenAI-compatible server named by env → a per-cell
+    // shell command → the deterministic offline stub.
+    let worker: Box<dyn Worker> = if e.host.phase == HostPhase::Ready && e.host_handle.is_some() {
+        let h = e.host_handle.clone().unwrap();
+        eprintln!("worker: materialized vLLM host @ {}", h.endpoint);
+        Box::new(OpenAiWorker { base_url: h.endpoint, model: h.model, api_key: std::env::var("SPARK_OPENAI_API_KEY").ok() })
+    } else if let Some(http) = OpenAiWorker::from_env() {
         eprintln!("worker: OpenAI HTTP @ {}", http.base_url);
         Box::new(http)
     } else if let Ok(cmd) = std::env::var("SPARK_WORKER_CMD") {

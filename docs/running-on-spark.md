@@ -6,11 +6,11 @@ verification gate through two seams. This guide wires both to real infrastructur
 
 ```
    developer ── spark mode set queue ──▶  box residency: QUEUE
-        │
+        │                                 └─▶ launch vLLM container on the box over SSH (SPARK_SSH_TARGET)
    spark admit unit.json  ──▶  queue (binding-homogeneity guard)
         │
-   spark serve  ──┬─▶  Worker   = a served model        (SPARK_OPENAI_BASE_URL | SPARK_WORKER_CMD)
-                  └─▶  Oracle    = a protected test/gate (SPARK_ORACLE_CMD)
+   spark serve  ──┬─▶  Worker   = the materialized host  (else SPARK_OPENAI_BASE_URL | SPARK_WORKER_CMD)
+                  └─▶  Oracle    = a protected test/gate  (SPARK_ORACLE_CMD)
                           │
                           ▼
                   durable verdict log  .spark/verdicts.jsonl
@@ -33,8 +33,38 @@ On the box you also need **one served model** reachable over HTTP, and a
 
 ## 2. Serve a model on the box
 
-Pick whatever you run on the Spark. `spark` only needs an OpenAI-compatible
-`/v1/chat/completions` endpoint.
+`spark` only needs an OpenAI-compatible `/v1/chat/completions` endpoint. You can
+let the switch start it for you, or manage the server yourself.
+
+### Option A — let the switch start it (vLLM over SSH)
+
+Set `SPARK_SSH_TARGET` and `spark mode set` **materializes the residency**: it
+retires any live host, launches the mode's model as a **vLLM container** on the box
+over SSH, polls `/v1` until it answers, and only then serves. The switch becomes a
+real start/stop of VRAM, and `spark serve` auto-targets the host.
+
+```bash
+export SPARK_SSH_TARGET=dev@spark-abcd.local     # enables the built-in SshVllmHost
+export SPARK_QUEUE_MODEL=qwen2.5-coder-7b        # model vLLM loads in QUEUE mode
+export SPARK_EXPLORER_MODEL=llama-3.1-70b        # model vLLM loads in EXPLORER mode
+export SPARK_VLLM_IMAGE=vllm/vllm-openai:latest  # optional; the container image
+export SPARK_VLLM_PORT=8000                      # optional; the served port
+export SPARK_VLLM_ARGS="--quantization awq"      # optional; extra vLLM flags
+
+spark mode set queue
+#   materializing residency: launching `vllm/vllm-openai:latest` (qwen2.5-coder-7b) on dev@spark-abcd.local ...
+#   residency ready at http://spark-abcd.local:8000
+```
+
+Under the hood it runs `docker run -d --gpus all … vllm/vllm-openai … --model … --port …`
+(detached, so the server survives the SSH session) and force-removes the container on
+the next flip. Prerequisite: **key-based SSH** to the box (NVIDIA Sync or your own
+key) and Docker with the NVIDIA runtime on it.
+
+### Option B — manage the server yourself
+
+Leave `SPARK_SSH_TARGET` unset and run any OpenAI-compatible server on the box, then
+point `spark` at it with `SPARK_OPENAI_BASE_URL` (§3).
 
 **llama.cpp (`llama-server`)**
 
@@ -86,6 +116,7 @@ to the request.
 
 | Condition | Worker |
 |---|---|
+| a residency materialized by `spark mode set` (host ready) | `OpenAiWorker` → the on-box vLLM host |
 | `SPARK_OPENAI_BASE_URL` set | `OpenAiWorker` (HTTP, persistent server) |
 | else `SPARK_WORKER_CMD` set | `CommandWorker` (shells out per cell, prompt on stdin) |
 | else | `StubWorker` (deterministic, offline) |
@@ -139,11 +170,12 @@ cat .spark/verdicts.jsonl        # the durable, append-only log (idempotent by b
 
 ### EXPLORER mode
 
-One large model, serial — for discovery rather than batched units. Swap the resident
-server for your big model, then:
+One large model, serial — for discovery rather than batched units. With Option A
+configured, the flip swaps the container for you (retire the QUEUE host, launch
+`SPARK_EXPLORER_MODEL`); otherwise swap the resident server yourself first. Then:
 
 ```bash
-spark mode set explorer
+spark mode set explorer          # retires the QUEUE vLLM host, launches the EXPLORER model
 spark explore                    # produces a discovery record (candidate structure, NOT accepted code)
 ```
 
@@ -154,6 +186,9 @@ spark explore                    # produces a discovery record (candidate struct
 | Step | Invariant / guard |
 |---|---|
 | `mode set` | `inv-distinct-mode` — a no-op flip is refused; flips are a deliberate human act |
+| host launch | `inv-containerized-host` — vLLM runs only as a container; `inv-single-serving-host` — the prior host is retired first |
+| host ready | `inv-ready-needs-launch` — only a launching host is confirmed ready, and only a ready host serves work |
+| host retire | `inv-nothing-to-retire` — the live host is stopped (freeing VRAM) before the next launches |
 | `admit` | binding-homogeneity — a mixed-binding unit is a decomposition defect, never dispatched |
 | sandbox provision | `inv-undeclared-network` — only declared destinations reachable |
 | credential lease | `inv-lease-needs-sandbox` — authority bound to the live sandbox |
@@ -178,7 +213,9 @@ spark explore                    # produces a discovery record (candidate struct
 
 | Symptom | Likely cause |
 |---|---|
-| `worker: offline stub …` printed | neither `SPARK_OPENAI_BASE_URL` nor `SPARK_WORKER_CMD` set |
+| `host launched but /v1 did not answer in time` | vLLM still loading weights, wrong `SPARK_VLLM_PORT`, or no NVIDIA runtime on the box |
+| `residency materialization failed: ssh …` | no key-based SSH to `SPARK_SSH_TARGET`, or Docker missing on the box |
+| `worker: offline stub …` printed | no materialized host and neither `SPARK_OPENAI_BASE_URL` nor `SPARK_WORKER_CMD` set |
 | `connect 127.0.0.1:8080: …` | model server not up / wrong port |
 | `non-200 from …` | bad model name, missing/incorrect API key |
 | `only http:// urls supported` | `OpenAiWorker` is `http`-only; use a TLS `Worker` for `https` |

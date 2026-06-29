@@ -13,6 +13,7 @@ with a trait boundary so real infrastructure drops in without changing the spec.
 | Credentials | none | `spark-sandbox` | `CredentialBroker` | `LocalBroker` (leased token) |
 | Verdict stream | in-memory `Vec` | `spark-stream` | — (`DurableLog`) | append-only JSONL on disk |
 | Protected oracle | pass-all closure | `spark-execution` | `Oracle` | `CommandOracle` (ADR-076) |
+| Residency (vLLM host) | enum-flip, no process | `spark-host` | `ResidencyHost` | `LocalProcessHost` / `SshVllmHost` |
 
 ---
 
@@ -91,6 +92,32 @@ pub struct CommandOracle { pub command: String, pub worker_writable: bool }
 `worker_writable` is true it **fails closed** — an unverified gate is never trusted,
 even if the command passes.
 
+## 5. Serving Host (`ctx-host` → `spark-host`)
+
+The demo's switch flipped an enum; no model ever loaded. The **`serving-host`**
+aggregate makes the switch *materialize the residency physically*. `LaunchHost` is
+guarded by `inv-containerized-host` (a host runs **only as a container** — a
+bare-metal launch is refused) and `inv-single-serving-host` (a host launches only
+when none is live, so the prior one is retired first — the box's one-residency rule
+in hardware). `ConfirmHostReady` is guarded by `inv-ready-needs-launch`, and only a
+ready host serves work; `RetireHost` by `inv-nothing-to-retire`.
+
+```rust
+pub trait ResidencyHost {
+    fn launch(&self, spec: &HostSpec) -> std::io::Result<HostHandle>;
+    fn retire(&self, handle: &HostHandle) -> std::io::Result<()>;
+}
+```
+
+- `SshVllmHost` — launches **vLLM as a detached container** on the box over SSH
+  (`docker run -d --gpus all … vllm/vllm-openai …`), then `probe_ready` polls the
+  `/v1` endpoint until it answers. The reused `OpenAiWorker` dispatches to it.
+- `LocalProcessHost` — a dev stand-in for an already-running local server.
+
+`Engine::launch_residency` retires any live host, launches the new one, waits for
+readiness, and confirms it — each transition `serving-host-decider`-gated. `spark
+mode set` calls it when `SPARK_SSH_TARGET` is configured.
+
 ---
 
 ## The `spark serve` pipeline
@@ -148,15 +175,16 @@ spark serve
 
 ## Conformance for the new deciders
 
-All six production deciders are proven sound & complete and behaviourally conformant:
+All seven production deciders are proven sound & complete and behaviourally conformant:
 
 ```bash
 CONF="$PWD/target/release/spark-conform"
 for d in resident-set-decider work-batch-decider sandbox-decider \
-         credential-lease-decider verdict-log-decider oracle-run-decider; do
+         credential-lease-decider verdict-log-decider oracle-run-decider \
+         serving-host-decider; do
   product decider conform "$d" --runner "$CONF $d"
 done
 ```
 
-Their deliverables (`deliverable-serving`, `-sandbox`, `-stream`, `-oracle`) are
-computed-done with acceptance criteria wired to named passing tests.
+Their deliverables (`deliverable-serving`, `-sandbox`, `-stream`, `-oracle`, `-host`)
+are computed-done with acceptance criteria wired to named passing tests.

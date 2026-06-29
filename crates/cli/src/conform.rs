@@ -11,6 +11,7 @@ use spark_exploration::{SessionCommand, SessionState};
 use spark_execution::{OracleCommand, OracleRunState, RunCommand, RunState};
 use spark_interface::WorkUnit;
 use spark_queue::{UnitCommand, UnitEvent, UnitState};
+use spark_host::{HostCommand, HostEvent, HostState};
 use spark_sandbox::{LeaseCommand, LeaseEvent, LeaseState, SandboxCommand, SandboxEvent, SandboxState};
 use spark_serving::{BatchCommand, BatchEvent, BatchState, BindingCommand, BindingEvent, ResidentState};
 use spark_stream::{LogCommand, LogEvent, LogState};
@@ -324,6 +325,34 @@ fn oracle_run_decider(_given: &[Value], when: &Value) -> Value {
     }
 }
 
+fn serving_host_decider(given: &[Value], when: &Value) -> Value {
+    let mut st = HostState::default();
+    for g in given {
+        match ev(g).0.as_str() {
+            "host-launched" => st.evolve(&HostEvent::HostLaunched),
+            "host-ready" => st.evolve(&HostEvent::HostReady),
+            "host-retired" => st.evolve(&HostEvent::HostRetired),
+            _ => {}
+        }
+    }
+    let (id, p) = cmd(when);
+    let command = match id.as_str() {
+        "launch-host" => HostCommand::Launch { containerized: bool_of(&p, "containerized") },
+        "confirm-host-ready" => HostCommand::ConfirmReady,
+        "retire-host" => HostCommand::Retire,
+        _ => return reject("unknown-command"),
+    };
+    let name = |e: &HostEvent| match e {
+        HostEvent::HostLaunched => "host-launched",
+        HostEvent::HostReady => "host-ready",
+        HostEvent::HostRetired => "host-retired",
+    };
+    match st.decide(&command) {
+        Ok(es) => emit(es.iter().map(|e| json!(name(e))).collect()),
+        Err(inv) => reject(inv),
+    }
+}
+
 fn main() {
     let _ = WorkUnit::is_binding_homogeneous; // keep interface linked for clarity
     let which = std::env::args().nth(1).unwrap_or_default();
@@ -346,6 +375,7 @@ fn main() {
                 "credential-lease-decider" => credential_lease_decider(&given, &when),
                 "verdict-log-decider" => verdict_log_decider(&given, &when),
                 "oracle-run-decider" => oracle_run_decider(&given, &when),
+                "serving-host-decider" => serving_host_decider(&given, &when),
                 _ => reject("unknown-decider"),
             }
         })

@@ -30,6 +30,10 @@
       {
         "id": "ctx-stream",
         "label": "Verdict Stream"
+      },
+      {
+        "id": "ctx-host",
+        "label": "Serving Host"
       }
     ],
     "entities": [
@@ -384,6 +388,44 @@
             "type": "boolean"
           }
         ]
+      },
+      {
+        "id": "serving-host",
+        "label": "ServingHost",
+        "context": "ctx-host",
+        "definition": "One vLLM inference server materializing a single model binding on the box, launched as a container over SSH and serving an OpenAI-compatible endpoint. It carries the binding it serves (model + served quantization + params — homogeneous, exactly one), the container image, the ssh target it runs on, and the endpoint base URL clients reach once it is ready. Its lifecycle is phased: offline (nothing launched) → launching (container started, not yet answering) → ready (health probe passed, /v1 serving) → retired (container stopped, VRAM freed). A host is the physical counterpart of a resident-set entry; only a ready host can serve cell frontiers, and at most one host is materialized at a time.",
+        "identity": "host_id",
+        "is_aggregate_root": true,
+        "attributes": [
+          {
+            "name": "host_id",
+            "type": "string"
+          },
+          {
+            "name": "mode",
+            "type": "string"
+          },
+          {
+            "name": "binding",
+            "type": "object"
+          },
+          {
+            "name": "image",
+            "type": "string"
+          },
+          {
+            "name": "ssh_target",
+            "type": "string"
+          },
+          {
+            "name": "endpoint",
+            "type": "string"
+          },
+          {
+            "name": "phase",
+            "type": "string"
+          }
+        ]
       }
     ],
     "value_objects": [],
@@ -514,6 +556,30 @@
         "statement": "A cell-gate may run only against an oracle the cell-worker has no write capability over. A worker that can write its own oracle is not verified (ADR-076).",
         "context": "ctx-execution",
         "applies_to": "oracle-run"
+      },
+      {
+        "id": "inv-single-serving-host",
+        "statement": "At most one serving host may be materialized at a time: a host may be launched only when none is currently live (offline or retired). The box holds one residency in VRAM; the current host must be retired before another binding is launched. This is the one-residency-at-a-time constraint made physical, giving inv-distinct-mode teeth in hardware.",
+        "context": "ctx-host",
+        "applies_to": "serving-host"
+      },
+      {
+        "id": "inv-containerized-host",
+        "statement": "A serving host may be launched only as a container. The vLLM server always runs containerized on the box — the container is the reproducibility and isolation boundary for the residency. A bare-metal launch request is refused.",
+        "context": "ctx-host",
+        "applies_to": "serving-host"
+      },
+      {
+        "id": "inv-ready-needs-launch",
+        "statement": "A host may be confirmed ready only while it is launching. Readiness is a transition out of the launching phase; confirming a host that is offline, already ready, or retired is a defect.",
+        "context": "ctx-host",
+        "applies_to": "serving-host"
+      },
+      {
+        "id": "inv-nothing-to-retire",
+        "statement": "A host may be retired only when one is live — launching or ready. Retiring from offline or retired has no container to stop and is a no-op error.",
+        "context": "ctx-host",
+        "applies_to": "serving-host"
       }
     ],
     "context_mappings": [],
@@ -709,6 +775,33 @@
         "emits": [
           "gate-confirmed"
         ]
+      },
+      {
+        "id": "launch-host",
+        "label": "LaunchHost",
+        "context": "ctx-host",
+        "targets": "serving-host",
+        "emits": [
+          "host-launched"
+        ]
+      },
+      {
+        "id": "confirm-host-ready",
+        "label": "ConfirmHostReady",
+        "context": "ctx-host",
+        "targets": "serving-host",
+        "emits": [
+          "host-ready"
+        ]
+      },
+      {
+        "id": "retire-host",
+        "label": "RetireHost",
+        "context": "ctx-host",
+        "targets": "serving-host",
+        "emits": [
+          "host-retired"
+        ]
       }
     ],
     "events": [
@@ -855,6 +948,24 @@
         "label": "GateConfirmed",
         "context": "ctx-execution",
         "changes": "oracle-run"
+      },
+      {
+        "id": "host-launched",
+        "label": "HostLaunched",
+        "context": "ctx-host",
+        "changes": "serving-host"
+      },
+      {
+        "id": "host-ready",
+        "label": "HostReady",
+        "context": "ctx-host",
+        "changes": "serving-host"
+      },
+      {
+        "id": "host-retired",
+        "label": "HostRetired",
+        "context": "ctx-host",
+        "changes": "serving-host"
       }
     ],
     "read_models": [
@@ -932,6 +1043,15 @@
           "verdict-appended",
           "deliverable-reconciled"
         ]
+      },
+      {
+        "id": "serving-host-view",
+        "label": "ServingHostView",
+        "projects": [
+          "host-launched",
+          "host-ready",
+          "host-retired"
+        ]
       }
     ],
     "wireframe_steps": [],
@@ -953,7 +1073,7 @@
     "triggers": [],
     "unreifiable_rules": []
   },
-  "tool_calls": 95,
+  "tool_calls": 108,
   "started_at": "2026-06-26T11:41:54.784597372+00:00",
   "finalized": false
 }

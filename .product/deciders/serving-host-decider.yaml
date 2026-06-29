@@ -1,0 +1,84 @@
+id: serving-host-decider
+decides_for: serving-host
+handles:
+- launch-host
+- confirm-host-ready
+- retire-host
+emits:
+- host-launched
+- host-ready
+- host-retired
+evolves_from:
+- host-launched
+- host-ready
+- host-retired
+rejects:
+- inv-single-serving-host
+- inv-containerized-host
+- inv-ready-needs-launch
+- inv-nothing-to-retire
+logic:
+  initial:
+    phase: "offline"
+  evolve:
+  - on: host-launched
+    set: { phase: "launching" }
+  - on: host-ready
+    set: { phase: "ready" }
+  - on: host-retired
+    set: { phase: "retired" }
+  decide:
+  - on: launch-host
+    guards:
+    - expr: "command.containerized"
+      else_reject: inv-containerized-host
+    - expr: "state.phase == 'offline' || state.phase == 'retired'"
+      else_reject: inv-single-serving-host
+    emit: [host-launched]
+  - on: confirm-host-ready
+    guards:
+    - expr: "state.phase == 'launching'"
+      else_reject: inv-ready-needs-launch
+    emit: [host-ready]
+  - on: retire-host
+    guards:
+    - expr: "state.phase == 'launching' || state.phase == 'ready'"
+      else_reject: inv-nothing-to-retire
+    emit: [host-retired]
+scenarios:
+- name: a containerized vLLM host launches when nothing is resident
+  given: []
+  when: { command: launch-host, with: { containerized: true } }
+  then: { emit: [host-launched] }
+- name: a bare-metal launch is refused
+  given: []
+  when: { command: launch-host, with: { containerized: false } }
+  then: { reject: inv-containerized-host }
+- name: a second host cannot launch while one is already materialized
+  given: [host-launched]
+  when: { command: launch-host, with: { containerized: true } }
+  then: { reject: inv-single-serving-host }
+- name: a relaunch is allowed after the prior host is retired
+  given: [host-launched, host-retired]
+  when: { command: launch-host, with: { containerized: true } }
+  then: { emit: [host-launched] }
+- name: a launching host becomes ready when its health probe passes
+  given: [host-launched]
+  when: confirm-host-ready
+  then: { emit: [host-ready] }
+- name: confirming readiness with no host launching is refused
+  given: []
+  when: confirm-host-ready
+  then: { reject: inv-ready-needs-launch }
+- name: a launching host can be retired before it ever becomes ready
+  given: [host-launched]
+  when: retire-host
+  then: { emit: [host-retired] }
+- name: a ready host is retired to free VRAM for the other mode
+  given: [host-launched, host-ready]
+  when: retire-host
+  then: { emit: [host-retired] }
+- name: retiring when nothing is materialized is refused
+  given: []
+  when: retire-host
+  then: { reject: inv-nothing-to-retire }

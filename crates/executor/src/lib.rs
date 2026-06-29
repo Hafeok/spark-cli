@@ -4,9 +4,12 @@
 //! against a protected oracle -> reduce to a unit-verdict -> emit a VerdictEvent
 //! -> escalate unit-atomically. No machine-rate process flips the box.
 
+use std::time::{Duration, Instant};
+
 use serde::{Deserialize, Serialize};
 
 use spark_execution::{consequence_of, reduce_verdict, walk_cells, Oracle, RunCommand, RunState};
+use spark_host::{probe_ready, HostCommand, HostHandle, HostSpec, HostState, ResidencyHost, ServingHostView};
 use spark_exploration::{SessionCommand, SessionState};
 use spark_interface::{Verdict, VerdictEvent, WorkUnit};
 use spark_queue::{decide_admission, HeterogeneityRateView, PrioritySetView, UnitCommand, UnitEvent, UnitState};
@@ -52,6 +55,14 @@ pub struct Engine {
     pub heterogeneity_view: HeterogeneityRateView,
     pub verdict_view: VerdictStreamCount,
     pub utilization: UtilizationView,
+    /// The physical serving host that materializes the current residency (a vLLM
+    /// container on the box). Defaulted so older state.json files still load.
+    #[serde(default)]
+    pub host: HostState,
+    #[serde(default)]
+    pub host_handle: Option<HostHandle>,
+    #[serde(default)]
+    pub serving_host_view: ServingHostView,
     seq: u64,
 }
 
@@ -64,6 +75,33 @@ pub struct VerdictStreamCount {
 // PrioritySetView / HeterogeneityRateView need serde to persist; provide it here
 // via shadow structs would be heavy — instead we re-derive their numbers from
 // events, so we add Serialize/Deserialize on the source types in their crate.
+
+/// Split an `http://host:port` endpoint into `(host, port)` for the probe.
+fn host_port(endpoint: &str) -> (String, u16) {
+    let s = endpoint
+        .strip_prefix("http://")
+        .or_else(|| endpoint.strip_prefix("https://"))
+        .unwrap_or(endpoint);
+    let authority = s.split('/').next().unwrap_or(s);
+    match authority.rsplit_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse().unwrap_or(80)),
+        None => (authority.to_string(), 80),
+    }
+}
+
+/// Poll `host:port` until it accepts a connection or `timeout` elapses.
+fn wait_ready(host: &str, port: u16, timeout: Duration) -> bool {
+    let start = Instant::now();
+    loop {
+        if probe_ready(host, port, Duration::from_millis(500)) {
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
 
 impl Engine {
     pub fn new() -> Self {
@@ -82,6 +120,63 @@ impl Engine {
         self.mode = view.mode;
         self.utilization.mode = view.mode;
         Ok(self.mode)
+    }
+
+    /// Physically materialize the residency for the just-thrown mode: retire any
+    /// live host (the single-residency rule made physical), launch the new vLLM
+    /// host through the seam, then poll its endpoint and confirm it ready. Every
+    /// transition is `serving-host-decider`-gated. Returns Ok(true) when the host
+    /// answered before `ready_timeout`, Ok(false) when it launched but stayed
+    /// cold (the caller should not dispatch to it yet).
+    pub fn launch_residency(
+        &mut self,
+        host: &dyn ResidencyHost,
+        spec: &HostSpec,
+        ready_timeout: Duration,
+    ) -> std::io::Result<bool> {
+        // Free VRAM first: a live host must be retired before another launches.
+        self.retire_residency(host)?;
+
+        let events = self
+            .host
+            .decide(&HostCommand::Launch { containerized: true })
+            .map_err(|inv| std::io::Error::new(std::io::ErrorKind::Other, inv))?;
+        let handle = host.launch(spec)?;
+        for e in &events {
+            self.host.evolve(e);
+            self.serving_host_view.apply(e);
+        }
+        self.host_handle = Some(handle.clone());
+
+        // Readiness gate: do not confirm (and so do not let work dispatch) until
+        // the host's endpoint actually answers.
+        let (h, p) = host_port(&handle.endpoint);
+        let ready = wait_ready(&h, p, ready_timeout);
+        if ready {
+            if let Ok(events) = self.host.decide(&HostCommand::ConfirmReady) {
+                for e in &events {
+                    self.host.evolve(e);
+                    self.serving_host_view.apply(e);
+                }
+            }
+        }
+        Ok(ready)
+    }
+
+    /// Retire the live host (stop its container, free VRAM). A no-op when nothing
+    /// is materialized — `inv-nothing-to-retire` simply rejects and we return Ok.
+    pub fn retire_residency(&mut self, host: &dyn ResidencyHost) -> std::io::Result<()> {
+        if let Ok(events) = self.host.decide(&HostCommand::Retire) {
+            if let Some(h) = &self.host_handle {
+                host.retire(h)?;
+            }
+            for e in &events {
+                self.host.evolve(e);
+                self.serving_host_view.apply(e);
+            }
+            self.host_handle = None;
+        }
+        Ok(())
     }
 
     /// Receive a frozen WorkUnit across the seam and run the admission guard.
@@ -307,6 +402,36 @@ mod tests {
         let mut e = Engine::new();
         e.throw_switch(Mode::Queue).unwrap();
         assert_eq!(e.throw_switch(Mode::Queue), Err("inv-distinct-mode"));
+    }
+
+    #[test]
+    fn materializing_a_residency_launches_confirms_ready_then_retires() {
+        use spark_host::{HostPhase, HostSpec, LocalProcessHost, ServingHostView};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let host = LocalProcessHost { base_url: format!("http://127.0.0.1:{port}") };
+        let spec = HostSpec {
+            host_id: "queue-host".into(),
+            model: "coder".into(),
+            image: "vllm/vllm-openai:latest".into(),
+            ssh_target: String::new(),
+            port,
+            extra_args: vec![],
+        };
+        let mut e = Engine::new();
+        e.throw_switch(Mode::Queue).unwrap();
+
+        let ready = e.launch_residency(&host, &spec, Duration::from_secs(2)).unwrap();
+        assert!(ready, "a listening endpoint should confirm ready");
+        assert_eq!(e.host.phase, HostPhase::Ready);
+        assert_eq!(e.serving_host_view, ServingHostView { materialized: 1, ready: true });
+        assert_eq!(e.host_handle.as_ref().unwrap().model, "coder");
+
+        e.retire_residency(&host).unwrap();
+        assert_eq!(e.host.phase, HostPhase::Retired);
+        assert_eq!(e.serving_host_view, ServingHostView { materialized: 0, ready: false });
+        assert!(e.host_handle.is_none());
     }
 }
 

@@ -20,3 +20,4 @@ spark-executor = { path = "crates/executor" }
 spark-serving = { path = "crates/serving" }
 spark-sandbox = { path = "crates/sandbox" }
 spark-stream = { path = "crates/stream" }
+spark-host = { path = "crates/host" }

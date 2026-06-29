@@ -154,6 +154,7 @@ dependencies = [
  "spark-execution",
  "spark-executor",
  "spark-exploration",
+ "spark-host",
  "spark-interface",
  "spark-queue",
  "spark-sandbox",
@@ -178,6 +179,7 @@ dependencies = [
  "serde_json",
  "spark-execution",
  "spark-exploration",
+ "spark-host",
  "spark-interface",
  "spark-queue",
  "spark-sandbox",
@@ -191,6 +193,13 @@ name = "spark-exploration"
 version = "0.1.0"
 dependencies = [
  "spark-switch",
+]
+
+[[package]]
+name = "spark-host"
+version = "0.1.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

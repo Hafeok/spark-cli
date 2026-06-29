@@ -1,0 +1,23 @@
+id: deliverable-host
+slice: slice-host
+acceptance:
+- id: sh-single
+  statement: A serving host launches only when nothing is currently materialized per inv-single-serving-host.
+  status: passing
+  runner: cargo-test
+  runner_args: second_launch_is_refused_while_one_is_live
+- id: sh-container
+  statement: A bare-metal launch is refused; a host launches only as a container per inv-containerized-host.
+  status: passing
+  runner: cargo-test
+  runner_args: bare_metal_launch_is_refused
+- id: sh-ready
+  statement: A host is confirmed ready only while it is launching per inv-ready-needs-launch.
+  status: passing
+  runner: cargo-test
+  runner_args: confirm_ready_requires_launching
+- id: sh-retire
+  statement: A host is retired only when one is live per inv-nothing-to-retire.
+  status: passing
+  runner: cargo-test
+  runner_args: retire_requires_a_live_host

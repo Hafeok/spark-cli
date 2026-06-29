@@ -45,7 +45,7 @@ mode; it lives elsewhere.)
 
 ---
 
-## Architecture (10 crates)
+## Architecture (11 crates)
 
 ```
 interface     WorkUnit / Cell / ModelBinding / VerdictEvent  (by-value contract, bundle_hash)
@@ -56,6 +56,7 @@ exploration   Exploration     — single serial discovery session (EXPLORER)
 serving       Model Serving   — VRAM residency + batched inference + Worker seam      ← production
 sandbox       Isolation       — per-unit ephemeral sandbox + brokered credentials     ← production
 stream        Verdict Stream  — durable, append-only, idempotent verdict log          ← production
+host          Serving Host    — vLLM residency materialized on the box over SSH       ← production
 executor      Engine          — composes everything; persists to .spark/state.json
 cli           spark / spark-conform binaries
 ```
@@ -70,7 +71,7 @@ invariant id); every read-model is a **projector** (an event fold).
 
 ```bash
 cargo build --release        # produces target/release/spark and spark-conform
-cargo test                   # 65 tests across the workspace
+cargo test                   # 79 tests across the workspace
 ```
 
 ## CLI usage
@@ -106,8 +107,23 @@ export SPARK_ORACLE_CMD='cargo test --quiet'
 spark mode set queue && spark admit unit.json && spark serve
 ```
 
-Worker precedence: `SPARK_OPENAI_BASE_URL` (HTTP) → `SPARK_WORKER_CMD` (shell) →
-offline `StubWorker`. **Full box setup: [`docs/running-on-spark.md`](docs/running-on-spark.md).**
+Worker precedence: a residency materialized by `spark mode set` → `SPARK_OPENAI_BASE_URL`
+(HTTP) → `SPARK_WORKER_CMD` (shell) → offline `StubWorker`. **Full box setup:
+[`docs/running-on-spark.md`](docs/running-on-spark.md).**
+
+### Let the switch start the model (vLLM over SSH)
+
+When `SPARK_SSH_TARGET` is set, `spark mode set` *physically materializes* the
+residency: it retires any live host, then launches the mode's model as a **vLLM
+container** on the box over SSH, polls its `/v1` endpoint, and only serves once it
+answers. The switch becomes a real start/stop of VRAM, not a flag — and `spark
+serve` then auto-targets that host.
+
+```bash
+export SPARK_SSH_TARGET=dev@spark-abcd.local      # → built-in SshVllmHost backend
+export SPARK_QUEUE_MODEL=qwen2.5-coder-7b         # model vLLM loads in QUEUE
+spark mode set queue                              # launches the container, waits until ready
+```
 
 ---
 
@@ -116,14 +132,14 @@ offline `StubWorker`. **Full box setup: [`docs/running-on-spark.md`](docs/runnin
 The implementation is derived from, and continuously checked against, a Product
 Framework model:
 
-- **What** — 7 bounded contexts, 12 entities (10 aggregate roots, each a decider),
+- **What** — 8 bounded contexts, 13 entities (11 aggregate roots, each a decider),
   events / commands / invariants / read-models.
-- **How** — 8 decisions, 9 principles, 10 patterns; the application contract and the
+- **How** — 9 decisions, 10 principles, 12 patterns; the application contract and the
   Rust crate layout.
 - **Deciders & projectors** — every aggregate's guarded state machine, proven
   **sound & complete** by simulation against its scenarios.
 - **Behavioural conformance (§6.3)** — `spark-conform` replays the *realised* Rust
-  deciders against the spec's scenario oracle. All 10 deciders are conformant.
+  deciders against the spec's scenario oracle. All 11 deciders are conformant.
 - **Deliverables** — acceptance criteria wired to named, passing `cargo test`s and
   **computed**-done.
 
@@ -142,11 +158,12 @@ product deliverable done deliverable-serving  # computed-done %
 
 ## Status
 
-- 65/65 tests pass · release build green
-- 10/10 deciders behaviourally conformant
-- 10/10 deliverables computed-done
+- 79/79 tests pass · release build green
+- 11/11 deciders behaviourally conformant
+- 11/11 deliverables computed-done
 - domain / how / archetype all conformant
 
-Physical infrastructure (GPU model serving, microVM isolation) is implemented behind
-the `Worker`, `SandboxRuntime`, and `CredentialBroker` **trait seams** with working
-local backends — a real server or container runtime drops in without touching the spec.
+Physical infrastructure (GPU model serving, microVM isolation, the on-box vLLM
+container) is implemented behind the `Worker`, `SandboxRuntime`, `CredentialBroker`,
+and `ResidencyHost` **trait seams** with working local backends — a real server, a
+container runtime, or the SSH/vLLM host drops in without touching the spec.

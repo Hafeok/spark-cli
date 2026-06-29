@@ -1,0 +1,26 @@
+id: serving-host-view-projector
+projects_for: serving-host-view
+folds:
+- host-launched
+- host-ready
+- host-retired
+over:
+- serving-host
+logic:
+  initial:
+    materialized: 0
+    ready: false
+  apply:
+  - on: host-launched
+    set: { materialized: "=view.materialized + 1", ready: false }
+  - on: host-ready
+    set: { ready: true }
+  - on: host-retired
+    set: { materialized: "=view.materialized - 1", ready: false }
+scenarios:
+- name: a launched then ready host is materialized and serving
+  given: [host-launched, host-ready]
+  then: { materialized: 1, ready: true }
+- name: retiring the host clears materialization and readiness
+  given: [host-launched, host-ready, host-retired]
+  then: { materialized: 0, ready: false }

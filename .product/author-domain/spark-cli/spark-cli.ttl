@@ -24,6 +24,9 @@ d:ctx-sandbox a pf:BoundedContext ;
 d:ctx-stream a pf:BoundedContext ;
   rdfs:label "Verdict Stream" .
 
+d:ctx-host a pf:BoundedContext ;
+  rdfs:label "Serving Host" .
+
 d:work-unit a pf:Entity ;
   rdfs:label "WorkUnit" ;
   pf:definition "The schedulable, reorderable, escalatable atom the executor consumes. Frozen and emitted by product dispatch, it crosses the Work-Unit Interface by value with its SPMC bundle inlined and identified by bundle_hash. Its cell_graph is a sealed interior — the executor's concern, never the queue's. Well-formed iff all of its cells require the same model binding (the binding-homogeneity invariant)." ;
@@ -164,6 +167,20 @@ d:oracle-run a pf:Entity ;
   pf:hasAttribute [ pf:attrName "oracle_ref" ; pf:attrType "string" ] ;
   pf:hasAttribute [ pf:attrName "worker_writable" ; pf:attrType "boolean" ] .
 
+d:serving-host a pf:Entity ;
+  rdfs:label "ServingHost" ;
+  pf:definition "One vLLM inference server materializing a single model binding on the box, launched as a container over SSH and serving an OpenAI-compatible endpoint. It carries the binding it serves (model + served quantization + params — homogeneous, exactly one), the container image, the ssh target it runs on, and the endpoint base URL clients reach once it is ready. Its lifecycle is phased: offline (nothing launched) → launching (container started, not yet answering) → ready (health probe passed, /v1 serving) → retired (container stopped, VRAM freed). A host is the physical counterpart of a resident-set entry; only a ready host can serve cell frontiers, and at most one host is materialized at a time." ;
+  pf:inContext d:ctx-host ;
+  pf:isAggregateRoot "true" ;
+  pf:identity "host_id" ;
+  pf:hasAttribute [ pf:attrName "host_id" ; pf:attrType "string" ] ;
+  pf:hasAttribute [ pf:attrName "mode" ; pf:attrType "string" ] ;
+  pf:hasAttribute [ pf:attrName "binding" ; pf:attrType "object" ] ;
+  pf:hasAttribute [ pf:attrName "image" ; pf:attrType "string" ] ;
+  pf:hasAttribute [ pf:attrName "ssh_target" ; pf:attrType "string" ] ;
+  pf:hasAttribute [ pf:attrName "endpoint" ; pf:attrType "string" ] ;
+  pf:hasAttribute [ pf:attrName "phase" ; pf:attrType "string" ] .
+
 d:inv-binding-homogeneity a pf:Invariant ;
   pf:statement "A work-unit is well-formed iff all of its cells require the same SPMC model binding. A binding-heterogeneous unit is a decomposition defect and must be rejected at admission, never dispatched into the executor." ;
   pf:inContext d:ctx-queue ;
@@ -268,6 +285,26 @@ d:inv-oracle-writable a pf:Invariant ;
   pf:statement "A cell-gate may run only against an oracle the cell-worker has no write capability over. A worker that can write its own oracle is not verified (ADR-076)." ;
   pf:inContext d:ctx-execution ;
   pf:appliesTo d:oracle-run .
+
+d:inv-single-serving-host a pf:Invariant ;
+  pf:statement "At most one serving host may be materialized at a time: a host may be launched only when none is currently live (offline or retired). The box holds one residency in VRAM; the current host must be retired before another binding is launched. This is the one-residency-at-a-time constraint made physical, giving inv-distinct-mode teeth in hardware." ;
+  pf:inContext d:ctx-host ;
+  pf:appliesTo d:serving-host .
+
+d:inv-containerized-host a pf:Invariant ;
+  pf:statement "A serving host may be launched only as a container. The vLLM server always runs containerized on the box — the container is the reproducibility and isolation boundary for the residency. A bare-metal launch request is refused." ;
+  pf:inContext d:ctx-host ;
+  pf:appliesTo d:serving-host .
+
+d:inv-ready-needs-launch a pf:Invariant ;
+  pf:statement "A host may be confirmed ready only while it is launching. Readiness is a transition out of the launching phase; confirming a host that is offline, already ready, or retired is a defect." ;
+  pf:inContext d:ctx-host ;
+  pf:appliesTo d:serving-host .
+
+d:inv-nothing-to-retire a pf:Invariant ;
+  pf:statement "A host may be retired only when one is live — launching or ready. Retiring from offline or retired has no container to stop and is a no-op error." ;
+  pf:inContext d:ctx-host ;
+  pf:appliesTo d:serving-host .
 
 d:admit-work-unit a pf:Command ;
   rdfs:label "AdmitWorkUnit" ;
@@ -398,6 +435,24 @@ d:run-gate a pf:Command ;
   pf:targets d:oracle-run ;
   pf:emits d:gate-confirmed .
 
+d:launch-host a pf:Command ;
+  rdfs:label "LaunchHost" ;
+  pf:inContext d:ctx-host ;
+  pf:targets d:serving-host ;
+  pf:emits d:host-launched .
+
+d:confirm-host-ready a pf:Command ;
+  rdfs:label "ConfirmHostReady" ;
+  pf:inContext d:ctx-host ;
+  pf:targets d:serving-host ;
+  pf:emits d:host-ready .
+
+d:retire-host a pf:Command ;
+  rdfs:label "RetireHost" ;
+  pf:inContext d:ctx-host ;
+  pf:targets d:serving-host ;
+  pf:emits d:host-retired .
+
 d:work-unit-enqueued a pf:Event ;
   rdfs:label "WorkUnitEnqueued" ;
   pf:inContext d:ctx-queue ;
@@ -518,6 +573,21 @@ d:gate-confirmed a pf:Event ;
   pf:inContext d:ctx-execution ;
   pf:changes d:oracle-run .
 
+d:host-launched a pf:Event ;
+  rdfs:label "HostLaunched" ;
+  pf:inContext d:ctx-host ;
+  pf:changes d:serving-host .
+
+d:host-ready a pf:Event ;
+  rdfs:label "HostReady" ;
+  pf:inContext d:ctx-host ;
+  pf:changes d:serving-host .
+
+d:host-retired a pf:Event ;
+  rdfs:label "HostRetired" ;
+  pf:inContext d:ctx-host ;
+  pf:changes d:serving-host .
+
 d:priority-set-view a pf:ReadModel ;
   rdfs:label "PrioritySetView" ;
   pf:projects d:work-unit-enqueued ;
@@ -565,4 +635,10 @@ d:reconciliation-view a pf:ReadModel ;
   rdfs:label "ReconciliationView" ;
   pf:projects d:verdict-appended ;
   pf:projects d:deliverable-reconciled .
+
+d:serving-host-view a pf:ReadModel ;
+  rdfs:label "ServingHostView" ;
+  pf:projects d:host-launched ;
+  pf:projects d:host-ready ;
+  pf:projects d:host-retired .
 

@@ -15,3 +15,4 @@ spark-exploration = { workspace = true }
 spark-serving = { workspace = true }
 spark-sandbox = { workspace = true }
 spark-stream = { workspace = true }
+spark-host = { workspace = true }
